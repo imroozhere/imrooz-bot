@@ -1,34 +1,140 @@
+import os
+import random
+import requests
 import telebot
+from telebot import types
 
-TOKEN = '8961049217:AAFWq408kt2YdNPORU-tXfc7X5L2c7PzKFg'
-bot = telebot.TeleBot(TOKEN)
+# Telegram API fix & Token
+TELEGRAM_API_URL = 'https://api.telegram.org/bot{0}/{1}'
+BOT_TOKEN = '8961049217:AAFWq408kt2YdNPORU-tXfc7X5L2c7PzKFg'
 ADMIN_ID = 7055191372
 
-user_ids = set()
+# Binance Pay & BunnyTools details
+BINANCE_PAY_ID = '1280231304'
+BUNNY_API_KEY = 'bn_f14fb6d6ca7929fc3a637bcedd3c4c0'
+BUNNY_ORDER_URL = 'https://bunnytoolbot.tech/api/v1/order/create'
+BUNNY_PRODUCTS_URL = 'https://bunnytoolbot.tech/api/v1/products'
 
-products_stock = {
-    'Zoom Pro 28D': '4.0 USDT (Out of Stock)',
-    'Canva Pro Edu 1Y': '1.5 USDT (Out of Stock)',
-    'Super Duolingo 1Y': '3.0 USDT (Out of Stock)',
-    'Spotify 3M Link': '2.0 USDT (Out of Stock)',
-    'Surfshark VPN 2M': '3.0 USDT (Out of Stock)',
-    'NordVPN 3M Acc': '4.5 USDT (Out of Stock)',
-    'Amazon Prime 1M': '2.0 USDT (Out of Stock)',
-    'CapCut Pro 1M': '2.7 USDT (In Stock 24)',
-    'Gemini Pro 18M': '1.5 USDT (In Stock 407)',
-    'CapCut Pro 7D': '0.9 USDT (Out of Stock)',
-    'Muse AI 2B Tokens': '3.3 USDT (Out of Stock)',
-    'Crunchyroll 1M Link': '2.0 USDT (In Stock)',
+bot = telebot.TeleBot(BOT_TOKEN)
+
+user_ids = set()
+user_balances = {}
+deposit_awaiting_amt = set()
+active_deposits = {}
+user_languages = {}
+
+# Images Dictionary
+IMAGES = {
+    'shop': 'shopping_24908_54437.jpg',
+    'profile': 'pngtree-casual-man-flat-design-avatar-profile-picture-vector-png-image_1556598.png',
+    'history': '18348018.png',
+    'wallet': 'wallet-money-cartoon-vector-icon-illustration-finance-business-icon-isolated-flat-vector_128676-12862.png',
+    'support': 'man-is-wearing-headphones-headset-minimal-logo-depicting-it-support-services-minimalist-simple-modern-vector-logo-design_558213-64874.jpg',
+    'api': 'chain-icon-1076610-26264.jpg',
+    'lang': 'language.jpg',
+}
+
+# Products Catalog with Stock Status Connected
+PRODUCTS = {
+    'buy_zoom': {
+        'id': 101,
+        'match_name': 'Zoom Pro 28 Days',
+        'name': 'ZOOM PRO (28 DAYS)',
+        'selling_price': 4.0,
+        'base_label': '💻 ZOOM PRO 28D – 4.0 USDT (OUT OF STOCK)',
+    },
+    'buy_canva': {
+        'id': 102,
+        'match_name': 'Canva Pro Edu 1 Year Invite',
+        'name': 'CANVA PRO EDU (1 YEAR INVITE)',
+        'selling_price': 1.5,
+        'base_label': '🎨 CANVA PRO EDU 1Y – 1.5 USDT (OUT OF STOCK)',
+    },
+    'buy_duolingo': {
+        'id': 103,
+        'match_name': 'Super Duolingo 1 Year Promo Code',
+        'name': 'SUPER DUOLINGO (1 YEAR PROMO CODE)',
+        'selling_price': 3.0,
+        'base_label': '🦉 SUPER DUOLINGO 1Y – 3.0 USDT (OUT OF STOCK)',
+    },
+    'buy_spotify': {
+        'id': 104,
+        'match_name': 'Spotify Premium 3 Month Redeem Link',
+        'name': 'SPOTIFY PREMIUM (3 MONTH REDEEM LINK)',
+        'selling_price': 2.0,
+        'base_label': '🎧 SPOTIFY 3M LINK – 2.0 USDT (OUT OF STOCK)',
+    },
+    'buy_surfshark': {
+        'id': 105,
+        'match_name': 'Surfshark VPN 2 Month Coupon',
+        'name': 'SURFSHARK VPN (2 MONTH COUPON)',
+        'selling_price': 3.0,
+        'base_label': '🦈 SURFSHARK VPN 2M – 3.0 USDT (OUT OF STOCK)',
+    },
+    'buy_nord': {
+        'id': 106,
+        'match_name': 'NordVPN 3M Account',
+        'name': 'NORDVPN (3M ACCOUNT)',
+        'selling_price': 4.5,
+        'base_label': '🛡️ NORDVPN 3M ACC – 4.5 USDT (OUT OF STOCK)',
+    },
+    'buy_amazon': {
+        'id': 107,
+        'match_name': 'Amazon Prime Video 1 Month',
+        'name': 'AMAZON PRIME VIDEO (1 MONTH)',
+        'selling_price': 2.0,
+        'base_label': '📦 AMAZON PRIME 1M – 2.0 USDT (OUT OF STOCK)',
+    },
+    'buy_capcut': {
+        'id': 108,
+        'match_name': 'CapCut Pro 1 Month',
+        'name': 'CAPCUT PRO (1 MONTH)',
+        'selling_price': 2.7,
+        'base_label': '🎬 CAPCUT PRO 1M – 2.7 USDT (IN STOCK 24)',
+    },
+    'buy_gemini': {
+        'id': 109,
+        'match_name': 'Gemini Pro 18 Months',
+        'name': 'GEMINI PRO (18 MONTHS)',
+        'selling_price': 1.5,
+        'base_label': '✨ GEMINI PRO 18M – 1.5 USDT (IN STOCK 407)',
+    },
+    'buy_capcut7d': {
+        'id': 110,
+        'match_name': 'CapCut Pro 7 Days',
+        'name': 'CAPCUT PRO (7 DAYS)',
+        'selling_price': 0.9,
+        'base_label': '🎬 CAPCUT PRO 7D – 0.9 USDT (OUT OF STOCK)',
+    },
+    'buy_muse': {
+        'id': 111,
+        'match_name': 'Muse AI 2B Tokens',
+        'name': 'MUSE AI (2B TOKENS)',
+        'selling_price': 3.3,
+        'base_label': '🔮 MUSE AI 2B TOKENS – 3.3 USDT (OUT OF STOCK)',
+    },
+    'buy_crunchyroll': {
+        'id': 112,
+        'match_name': 'Crunchyroll 1M Link',
+        'name': 'CRUNCHYROLL (1M LINK)',
+        'selling_price': 2.0,
+        'base_label': '🍙 CRUNCHYROLL 1M LINK – 2.0 USDT (IN STOCK)',
+    },
 }
 
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
   user_ids.add(message.chat.id)
-  bot.reply_to(
-      message,
-      'Khush amdeed! Current stock check karne ke liye /stock command use'
-      ' karein.',
+  markup = types.InlineKeyboardMarkup(row_width=2)
+  for key, prod in PRODUCTS.items():
+    markup.add(types.InlineKeyboardButton(prod['base_label'], callback_data=key))
+  bot.send_message(
+      message.chat.id,
+      '🛒 **IMROOZ AI STORE – AVAILABLE STOCK**\n\nSELECT A PRODUCT TO BUY'
+      ' INSTANTLY USING YOUR BALANCE:',
+      reply_markup=markup,
+      parse_mode='Markdown',
   )
 
 
@@ -64,10 +170,10 @@ def add_new_stock(message):
 @bot.message_handler(commands=['stock'])
 def check_stock(message):
   catalog_text = '🛍️ **IMROOZ VIP STORE – AVAILABLE STOCK**\n\n'
-  for prod, status in products_stock.items():
-    catalog_text += f'• {prod} – {status}\n'
+  for prod, details in PRODUCTS.items():
+    catalog_text += f"• {details['match_name']} – {details['base_label']}\n"
   bot.reply_to(message, catalog_text, parse_mode='Markdown')
 
 
-print('Bot chal raha hai...')
+print('Bot successfully chal raha hai...')
 bot.infinity_polling()
