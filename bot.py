@@ -15,7 +15,6 @@ BINANCE_PAY_ID = "1286251304"
 # BunnyTools API Details
 BUNNY_API_KEY = "bn_f14fb6d68ca792bf0eab637bedd5c4e0"
 BUNNY_ORDER_URL = "https://bunnytoolbot.tech/api/v1/order/create"
-BUNNY_PRODUCTS_URL = "https://bunnytoolbot.tech/api/v1/products"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -41,7 +40,7 @@ IMAGES = {
     "lang": "language.jpg",
 }
 
-# Products Catalog with Exact Bunny AI IDs connected directly
+# Products Catalog with Your Custom Selling Prices & IDs
 PRODUCTS = {
     "buy_zoom": {
         "id": 32,
@@ -116,26 +115,6 @@ PRODUCTS = {
         "base_label": "🍙 CRUNCHYROLL 1M LINK — 2.0 USDT",
     },
 }
-
-
-# Ab stock ID ke zariye direct fetch hoga jo kabhi fail nahi hoga
-def get_live_stock_map():
-  stock_map = {}
-  try:
-    headers = {"X-API-Key": BUNNY_API_KEY}
-    res = requests.get(BUNNY_PRODUCTS_URL, headers=headers, timeout=8)
-    if res.status_code == 200:
-      data = res.json()
-      for item in data.get("products", []):
-        try:
-          prod_id = int(item.get("id"))
-          stock_val = item.get("stock_count", item.get("stock", 0))
-          stock_map[prod_id] = int(stock_val)
-        except:
-          pass
-  except Exception as e:
-    print(f"Stock fetch error: {e}")
-  return stock_map
 
 
 try:
@@ -251,16 +230,10 @@ def handle_query(call):
   if call.data == "shop_menu":
     deposit_awaiting_amt.discard(chat_id)
     active_deposits.pop(chat_id, None)
-    live_stocks = get_live_stock_map()
     markup = types.InlineKeyboardMarkup()
 
     for key, item in PRODUCTS.items():
-      prod_id = item["id"]
-      stock = live_stocks.get(prod_id, 0)
-      if stock > 0:
-        btn_text = f"{item['base_label']} (IN STOCK {stock})"
-      else:
-        btn_text = f"{item['base_label']} (OUT OF STOCK)"
+      btn_text = f"{item['base_label']} (IN STOCK)"
       markup.add(types.InlineKeyboardButton(btn_text, callback_data=key))
 
     markup.add(
@@ -374,24 +347,6 @@ def handle_query(call):
     deposit_awaiting_amt.discard(chat_id)
     active_deposits.pop(chat_id, None)
     item = PRODUCTS[call.data]
-    live_stocks = get_live_stock_map()
-    stock = live_stocks.get(item["id"], 0)
-
-    if stock == 0:
-      markup = types.InlineKeyboardMarkup()
-      markup.add(
-          types.InlineKeyboardButton(
-              "🔙 BACK TO PRODUCTS", callback_data="shop_menu"
-          )
-      )
-      bot.send_message(
-          chat_id,
-          f"⚠️ SORRY! **{item['name']}** IS CURRENTLY OUT OF STOCK.",
-          reply_markup=markup,
-          parse_mode="Markdown",
-      )
-      return
-
     balance = user_balances.get(chat_id, 0.0)
     needed = item["selling_price"]
 
@@ -460,7 +415,10 @@ def handle_query(call):
         chat_id, "⏳ PROCESSING ORDER, FETCHING STOCK FROM SUPPLIER..."
     )
 
-    headers = {"X-API-Key": BUNNY_API_KEY}
+    headers = {
+        "X-API-Key": BUNNY_API_KEY,
+        "Content-Type": "application/json",
+    }
     payload_order = {
         "product_id": item["id"],
         "quantity": 1,
