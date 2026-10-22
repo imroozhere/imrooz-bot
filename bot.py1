@@ -1,0 +1,526 @@
+"""
+IMROOZ SERVICE [AUTO ORDER] - Telegram reseller bot
+=====================================================
+
+Customer-facing flow:
+  /start -> Shop -> pick product -> confirm -> bot buys it from the
+  SUPPLIER automatically using the bot's OWN wallet balance with the
+  supplier, and sends the delivered item to the customer. Customer pays
+  the bot owner via Binance Pay; admin approves deposits manually with
+  the /approve command.
+
+Supplier: TUNVN PREHUB - https://tunvnmmo.duckdns.org
+  Docs: https://tunvnmmo.duckdns.org/api/docs
+  Auth: header "X-API-Key: <key>"
+  Endpoints used here:
+    GET  /api/products            -> live product list + stock
+    POST /api/buy                 -> spend OUR wallet balance to buy 1 item
+    GET  /api/balance             -> check OUR wallet balance with supplier
+    POST /api/deposit             -> top up OUR wallet balance with supplier
+    GET  /api/deposit/status      -> check a deposit's status
+
+IMPORTANT - things to verify once you actually run this (the dev sandbox
+used to write this code could not reach tunvnmmo.duckdns.org to confirm
+exact field names):
+  1. get_live_products() guesses the JSON field names for id/name/price/
+     stock. If the shop menu comes up empty, check the console/log output
+     for lines starting with "[supplier]" - they print the raw JSON - and
+     tell Claude what you see so the field names can be fixed.
+  2. do_supplier_buy() guesses where the delivered account/code is in the
+     /api/buy response. Same deal - check the printed raw response if the
+     delivered item looks wrong.
+"""
+
+import time
+import random
+import requests
+import telebot
+from telebot import types
+
+# ---------------------------------------------------------------- CONFIG
+
+telebot.apihelper.API_URL = "https://api.telegram.org/bot{0}/{1}"
+
+BOT_TOKEN = "8911606774:AAG_4ZQNHB6_5x6wNmkps7WPfpZoTU7qrlA"
+
+# Admin's Telegram numeric ID (gets admin commands + approves deposits)
+ADMIN_ID = 7055191372
+
+# Store branding / payment / support
+STORE_NAME = "IMROOZ SERVICE [AUTO ORDER]"
+BINANCE_PAY_ID = "1286251304"
+SUPPORT_USERNAME = "@Imrokhan21"
+
+# ---- Supplier: TUNVN PREHUB ----
+SUPPLIER_BASE_URL = "https://tunvnmmo.duckdns.org"
+SUPPLIER_API_KEY = "02744966b7b514c6e065c7a051f5f931c50b707105eedfcfb25a5e4d96c33db1"
+SUPPLIER_PRODUCTS_URL = SUPPLIER_BASE_URL + "/api/products"
+SUPPLIER_BUY_URL = SUPPLIER_BASE_URL + "/api/buy"
+SUPPLIER_BALANCE_URL = SUPPLIER_BASE_URL + "/api/balance"
+SUPPLIER_DEPOSIT_URL = SUPPLIER_BASE_URL + "/api/deposit"
+SUPPLIER_DEPOSIT_STATUS_URL = SUPPLIER_BASE_URL + "/api/deposit/status"
+SUPPLIER_ORDERS_URL = SUPPLIER_BASE_URL + "/api/orders"
+
+SUPPLIER_HEADERS = {"X-API-Key": SUPPLIER_API_KEY}
+
+# How much profit to add on top of the supplier's price.
+# 20 means: supplier price * 1.20 (20% markup). Change this single number
+# any time you want to raise/lower your margin - nothing else needs editing.
+PROFIT_MARGIN_PERCENT = 20
+
+# How long (seconds) to cache the supplier's product list before refetching.
+PRODUCTS_CACHE_SECONDS = 45
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+user_balances = {}
+deposit_awaiting_amt = set()
+active_deposits = {}
+
+_products_cache = {"items": [], "fetched_at": 0}
+
+
+# ---------------------------------------------------------------- SUPPLIER API
+
+def _first_present(d, keys, default=None):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return default
+
+
+def fetch_products_from_supplier():
+    """Calls GET /api/products and normalizes each item to:
+    {id, name, stock, supplier_price, selling_price}
+    Field names are guessed defensively - see module docstring."""
+    try:
+        res = requests.get(SUPPLIER_PRODUCTS_URL, headers=SUPPLIER_HEADERS, timeout=10)
+    except Exception as e:
+        print("[supplier] products fetch failed: " + str(e))
+        return []
+
+    if res.status_code != 200:
+        print("[supplier] products fetch bad status " + str(res.status_code) + ": " + res.text[:300])
+        return []
+
+    try:
+        data = res.json()
+    except Exception as e:
+        print("[supplier] products response not JSON: " + str(e))
+        return []
+
+    # the list might be the root, or nested under "products"/"data"/"items"
+    if isinstance(data, list):
+        raw_list = data
+    else:
+        raw_list = data.get("products") or data.get("data") or data.get("items") or []
+
+    normalized = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        pid = _first_present(item, ["id", "product_id", "productId"])
+        name = _first_present(item, ["name", "title", "product_name"])
+        stock = _first_present(item, ["stock", "stock_count", "quantity", "available"], default=0)
+        price = _first_present(item, ["price", "price_usdt", "usdt_price", "cost", "selling_price"])
+        if pid is None or name is None or price is None:
+            print("[supplier] skipping product with unexpected shape: " + str(item))
+            continue
+        try:
+            stock = int(stock)
+        except Exception:
+            stock = 0
+        try:
+            price = float(price)
+        except Exception:
+            continue
+
+        selling_price = round(price * (1 + PROFIT_MARGIN_PERCENT / 100), 2)
+        normalized.append({
+            "id": pid,
+            "name": str(name),
+            "stock": stock,
+            "supplier_price": price,
+            "selling_price": selling_price,
+        })
+    return normalized
+
+
+def get_live_products(force=False):
+    now = time.time()
+    if (not force and _products_cache["items"]
+            and now - _products_cache["fetched_at"] < PRODUCTS_CACHE_SECONDS):
+        return _products_cache["items"]
+
+    items = fetch_products_from_supplier()
+    if items:
+        _products_cache["items"] = items
+        _products_cache["fetched_at"] = now
+        return items
+    # fetch failed - fall back to whatever we had cached, even if stale
+    return _products_cache["items"]
+
+
+def find_product(product_id):
+    for p in get_live_products():
+        if str(p["id"]) == str(product_id):
+            return p
+    return None
+
+
+def do_supplier_buy(product_id):
+    """POST /api/buy to actually fulfill 1 unit of product_id using OUR
+    supplier wallet balance. Returns (ok, delivered_text, raw)."""
+    payload = {"product_id": product_id, "quantity": 1, "currency": "usdt"}
+    try:
+        res = requests.post(SUPPLIER_BUY_URL, json=payload, headers=SUPPLIER_HEADERS, timeout=20)
+        data = res.json()
+    except Exception as e:
+        return False, "Connection error: " + str(e), {}
+
+    print("[supplier] /api/buy raw response: " + str(data))
+
+    success = data.get("success", res.status_code == 200)
+    if not success:
+        err = _first_present(data, ["message", "error", "detail"], default="Unknown error")
+        return False, str(err), data
+
+    # try the common shapes for "what the customer actually got"
+    order = data.get("order", data)
+    delivered = _first_present(
+        order,
+        ["delivered_item", "delivered", "item", "account", "credentials", "link", "data"],
+    )
+    if delivered is None:
+        delivered = str(data)  # last resort: show the raw payload, fix formatting later
+    return True, str(delivered), data
+
+
+def get_supplier_balance():
+    try:
+        res = requests.get(SUPPLIER_BALANCE_URL, headers=SUPPLIER_HEADERS, timeout=10)
+        return res.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def create_supplier_deposit(amount_usdt):
+    payload = {"amount": amount_usdt, "currency": "usdt"}
+    try:
+        res = requests.post(SUPPLIER_DEPOSIT_URL, json=payload, headers=SUPPLIER_HEADERS, timeout=15)
+        return res.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_supplier_deposit(payment_code):
+    try:
+        res = requests.get(
+            SUPPLIER_DEPOSIT_STATUS_URL,
+            params={"code": payment_code},
+            headers=SUPPLIER_HEADERS,
+            timeout=10,
+        )
+        return res.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------- BOT UI
+
+try:
+    bot.delete_webhook(drop_pending_updates=True)
+except Exception:
+    pass
+
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+@bot.message_handler(commands=["start"])
+def send_welcome(message):
+    show_main_menu(message.chat.id, message.from_user.first_name)
+
+
+def show_main_menu(chat_id, first_name="USER"):
+    deposit_awaiting_amt.discard(chat_id)
+    active_deposits.pop(chat_id, None)
+    balance = user_balances.get(chat_id, 0.0)
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Shop", callback_data="shop_menu"))
+    markup.row(
+        types.InlineKeyboardButton("Profile", callback_data="profile"),
+        types.InlineKeyboardButton("Order History", callback_data="history"),
+    )
+    markup.add(types.InlineKeyboardButton("Wallet", callback_data="wallet"))
+    markup.add(types.InlineKeyboardButton("Support", callback_data="support"))
+
+    welcome_text = (
+        "Welcome " + str(first_name) + "!\n\n"
+        "Quick Guide:\n"
+        "1. Tap \"Shop\".\n"
+        "2. Select the product you want to buy.\n"
+        "3. Choose payment method and pay via Binance Pay.\n"
+        "4. After payment is approved, the bot will automatically deliver your order.\n\n"
+        "Your wallet balance: " + ("%.2f" % balance) + " USDT\n\n"
+        "Please select a menu:"
+    )
+    bot.send_message(chat_id, welcome_text, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_query(call):
+    chat_id = call.message.chat.id
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except Exception:
+        pass
+
+    if call.data == "shop_menu":
+        deposit_awaiting_amt.discard(chat_id)
+        active_deposits.pop(chat_id, None)
+        products = get_live_products()
+        markup = types.InlineKeyboardMarkup()
+
+        if not products:
+            markup.add(types.InlineKeyboardButton("BACK", callback_data="back_main"))
+            bot.send_message(
+                chat_id,
+                "Products load nahi ho sake abhi, thodi dair baad try karein.",
+                reply_markup=markup,
+            )
+            return
+
+        for p in products:
+            if p["stock"] > 0:
+                label = p["name"] + " - " + str(p["selling_price"]) + " USDT (in stock " + str(p["stock"]) + ")"
+            else:
+                label = p["name"] + " (OUT OF STOCK)"
+            markup.add(types.InlineKeyboardButton(label, callback_data="buy_" + str(p["id"])))
+
+        markup.add(types.InlineKeyboardButton("BACK TO MAIN MENU", callback_data="back_main"))
+        bot.send_message(
+            chat_id,
+            "AVAILABLE STOCK\n\nSELECT A PRODUCT TO PURCHASE INSTANTLY USING YOUR BALANCE:",
+            reply_markup=markup,
+        )
+
+    elif call.data == "profile":
+        balance = user_balances.get(chat_id, 0.0)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("DEPOSIT FUNDS", callback_data="wallet"))
+        markup.add(types.InlineKeyboardButton("BACK", callback_data="back_main"))
+        bot.send_message(
+            chat_id,
+            "VIP USER PROFILE\n\nUSER ID: " + str(chat_id) + "\n"
+            + "CURRENT BALANCE: " + ("%.2f" % balance) + " USDT",
+            reply_markup=markup,
+        )
+
+    elif call.data == "wallet":
+        deposit_awaiting_amt.add(chat_id)
+        balance = user_balances.get(chat_id, 0.0)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("CANCEL / BACK", callback_data="back_main"))
+        bot.send_message(
+            chat_id,
+            "DEPOSIT / TOP-UP (BINANCE PAY)\n\n"
+            + "CURRENT BALANCE: " + ("%.2f" % balance) + " USDT\n\n"
+            + "MINIMUM DEPOSIT: 0.5 USDT\n\n"
+            + "TYPE AND SEND YOUR DEPOSIT AMOUNT (e.g. 0.5, 1, 5).",
+            reply_markup=markup,
+        )
+
+    elif call.data == "history":
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("BACK", callback_data="back_main"))
+        bot.send_message(
+            chat_id,
+            "ORDER HISTORY\n\nORDERS ARE DELIVERED INSTANTLY AND AUTOMATICALLY.",
+            reply_markup=markup,
+        )
+
+    elif call.data == "support":
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("BACK", callback_data="back_main"))
+        bot.send_message(
+            chat_id,
+            "CUSTOMER SUPPORT\n\nCONTACT: " + SUPPORT_USERNAME,
+            reply_markup=markup,
+        )
+
+    elif call.data == "back_main":
+        show_main_menu(chat_id)
+
+    elif call.data.startswith("buy_") and not call.data.startswith("buy_confirm_"):
+        product_id = call.data[len("buy_"):]
+        product = find_product(product_id)
+        if not product:
+            bot.send_message(chat_id, "Ye product ab available nahi hai.")
+            return
+        if product["stock"] <= 0:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("BACK TO PRODUCTS", callback_data="shop_menu"))
+            bot.send_message(
+                chat_id,
+                "SORRY! " + product["name"] + " IS CURRENTLY OUT OF STOCK.",
+                reply_markup=markup,
+            )
+            return
+
+        balance = user_balances.get(chat_id, 0.0)
+        price = product["selling_price"]
+
+        if balance < price:
+            diff = price - balance
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("DEPOSIT FUNDS NOW", callback_data="wallet"))
+            markup.add(types.InlineKeyboardButton("BACK TO PRODUCTS", callback_data="shop_menu"))
+            bot.send_message(
+                chat_id,
+                "INSUFFICIENT BALANCE!\n\n"
+                + "ITEM: " + product["name"] + "\n"
+                + "PRICE: " + str(price) + " USDT\n"
+                + "YOUR BALANCE: " + ("%.2f" % balance) + " USDT\n\n"
+                + "DEPOSIT AN ADDITIONAL " + ("%.2f" % diff) + " USDT.",
+                reply_markup=markup,
+            )
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "YES, BUY NOW (" + str(price) + " USDT)", callback_data="buy_confirm_" + str(product_id)
+            )
+        )
+        markup.add(types.InlineKeyboardButton("CANCEL", callback_data="shop_menu"))
+        bot.send_message(
+            chat_id,
+            "CONFIRM PURCHASE\n\n"
+            + "PRODUCT: " + product["name"] + "\n"
+            + "PRICE: " + str(price) + " USDT\n"
+            + "CURRENT BALANCE: " + ("%.2f" % balance) + " USDT\n\n"
+            + "REMAINING BALANCE AFTER PURCHASE: " + ("%.2f" % (balance - price)) + " USDT.",
+            reply_markup=markup,
+        )
+
+    elif call.data.startswith("buy_confirm_"):
+        product_id = call.data[len("buy_confirm_"):]
+        product = find_product(product_id)
+        if not product:
+            bot.send_message(chat_id, "Ye product ab available nahi hai.")
+            return
+
+        balance = user_balances.get(chat_id, 0.0)
+        price = product["selling_price"]
+        if balance < price:
+            bot.send_message(chat_id, "INSUFFICIENT BALANCE! PLEASE DEPOSIT FUNDS FIRST.")
+            return
+
+        bot.send_message(chat_id, "PROCESSING ORDER, FETCHING STOCK FROM SUPPLIER...")
+
+        ok, delivered_or_error, raw = do_supplier_buy(product["id"])
+
+        if ok:
+            user_balances[chat_id] = round(balance - price, 2)
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("SHOP MORE", callback_data="shop_menu"))
+            markup.add(types.InlineKeyboardButton("MAIN MENU", callback_data="back_main"))
+            bot.send_message(
+                chat_id,
+                "ORDER DELIVERED SUCCESSFULLY!\n\n"
+                + "PRODUCT: " + product["name"] + "\n"
+                + "ACCOUNT / STOCK:\n" + delivered_or_error + "\n\n"
+                + "REMAINING BALANCE: " + ("%.2f" % user_balances[chat_id]) + " USDT\n\n"
+                + "THANK YOU FOR USING " + STORE_NAME + "!",
+                reply_markup=markup,
+            )
+            # force a fresh stock count next time shop is opened
+            get_live_products(force=True)
+        else:
+            bot.send_message(
+                chat_id,
+                "ORDER COULD NOT BE DELIVERED: " + delivered_or_error + "\n"
+                + "YOUR BALANCE WAS NOT DEDUCTED. Contact " + SUPPORT_USERNAME + " if this repeats.",
+            )
+            try:
+                bot.send_message(
+                    ADMIN_ID,
+                    "Buy failed for user " + str(chat_id) + ", product " + str(product["id"])
+                    + " (" + product["name"] + "): " + delivered_or_error + "\nRaw: " + str(raw),
+                )
+            except Exception:
+                pass
+
+
+@bot.message_handler(func=lambda msg: True)
+def handle_all_messages(message):
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+
+    if chat_id in deposit_awaiting_amt:
+        deposit_awaiting_amt.discard(chat_id)
+        try:
+            base_amt = float(text)
+            if base_amt < 0.5:
+                bot.reply_to(message, "MINIMUM DEPOSIT LIMIT IS 0.5 USDT! Click 'DEPOSIT' again.")
+                return
+
+            bn_code = "BN" + str(random.randint(100000000000000, 999999999999999))
+            exact_amount = round(base_amt, 2)
+            active_deposits[chat_id] = exact_amount
+
+            invoice_text = (
+                "USDT DEPOSIT INVOICE\n\n"
+                + "CODE: " + bn_code + " (for tracking only)\n\n"
+                + "BINANCE PAY (INSTANT, FREE)\n"
+                + "BINANCE ID: " + BINANCE_PAY_ID + "\n"
+                + "AMOUNT: " + ("%.2f" % exact_amount) + "\n\n"
+                + "OPEN BINANCE PAY -> SEND TO ID WITH THE EXACT AMOUNT ABOVE!\n"
+                + "(After payment, send your Binance Order ID / TXID here)."
+            )
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("CANCEL / BACK", callback_data="back_main"))
+            bot.send_message(chat_id, invoice_text, reply_markup=markup)
+        except ValueError:
+            bot.reply_to(message, "Please enter a valid number (e.g. 0.5 or 1).")
+
+    elif chat_id in active_deposits:
+        expected = active_deposits.pop(chat_id)
+        bot.reply_to(
+            message,
+            "DEPOSIT REQUEST SUBMITTED!\n\n"
+            + "TXID (" + text + ") and amount (" + ("%.2f" % expected) + " USDT) recorded.\n"
+            + "Balance will be credited after admin approval!",
+        )
+        try:
+            bot.send_message(
+                ADMIN_ID,
+                "New deposit claim - user " + str(chat_id) + " (@" + str(message.from_user.username)
+                + ") says they sent " + ("%.2f" % expected) + " USDT, TXID: " + text
+                + "\n\nApprove with: /approve " + str(chat_id) + " " + ("%.2f" % expected),
+            )
+        except Exception:
+            pass
+        show_main_menu(chat_id)
+
+
+# ---------------------------------------------------------------- ADMIN COMMANDS
+
+@bot.message_handler(commands=["approve"])
+def approve_deposit(message):
+    """/approve <user_id> <amount>  - credits a customer's LOCAL wallet
+    balance after you've manually checked the Binance Pay transfer."""
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        parts = message.text.split()
+        target_id = int(parts[1])
+        amount = float(parts[2])
+    except (IndexError, ValueError):
+        bot.reply_to(message, "Format: /approve user_id amount")
+        return
+    user_balances[target_id] = round(user_balances.get(target_id, 0.0) + amount, 2)
+    bot.reply_to(message, "Credited " + ("%.2f" % amount) + " USDT to user 
